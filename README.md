@@ -24,3 +24,7 @@ The project required substantial data preparation. GA events had missing fields,
 ### What I Learned
 
 I gained experience building structured pipelines from unstructured behavioral data. This involved joining large fact tables, engineering temporal and event-based features, and validating models against real operational constraints. I also strengthened my ability to communicate technical insights in a business context. The project highlighted how behavioral analytics can inform platform design and operational decision making.
+
+### Files in this repository
+The `Ind Modeling.RMD` is a compilation of my contributed work to the group modeling. This does not include all insights and analyses gleaned from our group's modeling, just my individual coding contributions. 
+`Individual EDA` is all of the notes and coding I contributed to our group exploratory data analysis. There are some headers in there left blank for the purpose of denoting EDA was performed, but it was not by me.
