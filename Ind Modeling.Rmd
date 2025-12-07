@@ -1,0 +1,1437 @@
+---
+title: "Modeling"
+author: "DataLAKE"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-float: true
+    toc-title: "Contents"
+    self-contained: true
+execute:
+  include: true
+  eval: true
+  warning: false
+  message: false
+---
+
+## Introduction 
+
+This modeling notebook is just my individual contribution to the larger group modeling efforts. This includes initial attempts at hierarchal clustering and GMM, directed association rule mining efforts, and logistic regression modeling.
+
+```{r message=FALSE, warning=FALSE}
+# Import libraries
+pacman::p_load(
+  tidyverse, skimr, dplyr, jsonlite, stringr, purrr, tidyr, ggplot2, tibble, 
+  caret, grf, fixest, lubridate, patchwork, data.table, randomForest, 
+  factoextra, mclust, arules, arulesViz, ranger, xgboost, tidytext, 
+  rsample, scales, rlang, speedglm, pROC, dbscan, plotly
+)
+
+# install.packages("dbscan") 
+
+# Import 
+gao <- fread("google_analytics_orders.csv") |>
+  dplyr::select(-EVENT_ROW_ID)
+materials <- fread("material.csv")
+orders <- fread("merged_orders_customer_material.csv")
+
+# Examine the data
+gao |>
+  head()
+```
+
+## Feature Engineering
+
+### Add Days Since Last Purchased Field
+
+To better understand if the recency of a purchase affects cart abandonment, we engineered a `days_since_last_purchase` variable. This feature measures the number of days between an event and the most recent purchase, providing a proxy variable for consumer engagement. Unfortunately, due to the short time window of this dataset, many customers do not have a prior recorded purchase. In this case, the variable is recorded as `NA` to signify the lack of history. This variable will help us distinguish between new and repeat customers without introducing data leakage via a binary feature.
+
+```{r}
+add_days_since_last_purchase <- function(df, customer_col = CUSTOMER_ID, 
+                                         event_col = EVENT_TIMESTAMP_ADJ, 
+                                         purchase_flag = PURCHASE_EVENT, 
+                                         out_col = DAYS_SINCE_LAST_PURCHASE) {
+  # Convert to quosures for tidy evaluation
+  customer_col <- enquo(customer_col)
+  event_col <- enquo(event_col)
+  purchase_flag <- enquo(purchase_flag)
+  out_col <- enquo(out_col)
+  
+  df |>
+    arrange(!!customer_col, !!event_col) |>
+    group_by(!!customer_col) |>
+    mutate(
+      # Capture last purchase date for each event
+      last_purchase_date = if_else(!!purchase_flag == 1, !!event_col, NA),
+      last_purchase_date = as_datetime(zoo::na.locf(last_purchase_date, na.rm = FALSE)),
+      # Compute days difference
+      !!out_col := floor(as.numeric(difftime(!!event_col, last_purchase_date, units = "days"))
+    )) |>
+    ungroup() |>
+    dplyr::select(-last_purchase_date)
+}
+
+gao <- gao |>
+  mutate(PURCHASE_EVENT = if_else(ABANDONED == 0, 1, 0)) |>
+  add_days_since_last_purchase()
+```
+
+```{r}
+# remove old target variable column from EDA to avoid confusion
+gao <- gao |>
+  dplyr::select(-ABANDONED_CART)
+
+# check to make sure removal worked.
+head(gao)
+```
+
+## Analysis
+
+### Items in Abandoned Carts Analysis
+
+In an attempt to answer the business question, “Which products appear most frequently in abandoned carts?”, we wanted to find out if there were any specific items or category of items, that are correlated with cart abandonment. So we decided to calculate the number of carts that each item appears in, the number of abandoned carts that have each item, and the rate of abandonment for each item.
+
+Looking at different carts, the items listed in a cart often appear multiple times. To mitigate this, we used the last time the ITEMS column appears with products in it for each individual cart. We also joined the cart back with the materials table so that we could look at categories such as pack size/type, brand, and flavor. 
+
+```{r}
+compute_item_abandonment <- function(gao, materials) {
+
+  item_abandonment <- gao |>
+    # Keep only last entry per cart
+    group_by(CART_ID) |>
+    filter(EVENT_TIMESTAMP_ADJ == max(EVENT_TIMESTAMP_ADJ, na.rm = TRUE)) |>
+    ungroup() |>
+    
+    # Parse JSON safely
+    mutate(ITEMS_PARSED = purrr::map(ITEMS, function(x) {
+      if (is.na(x) || x == "" || x == "[]") return(NULL)
+      
+      # Fix invalid double quotes
+      x_clean <- gsub('""', '"', x, fixed = TRUE)
+      
+      # Try parsing JSON; return NULL if invalid
+      parsed <- tryCatch(fromJSON(x_clean), error = function(e) NULL)
+      return(parsed)
+    })) |>
+    
+    # Unnest only non-empty lists
+    filter(!map_lgl(ITEMS_PARSED, is.null)) |>
+    unnest(ITEMS_PARSED) |>
+    
+    dplyr::select(CART_ID, ITEM_ID = item_id, ABANDONED) |>
+    distinct(CART_ID, ITEM_ID, .keep_all = TRUE) |>
+    
+    # Aggregate by item
+    group_by(ITEM_ID) |>
+    summarise(
+      CARTS_WITH_ITEM = n_distinct(CART_ID),
+      ABANDONED_CARTS_WITH_ITEM = n_distinct(CART_ID[ABANDONED == 1]),
+      NON_ABANDONED_CARTS_WITH_ITEM = n_distinct(CART_ID[ABANDONED == 0]),
+      ABANDONMENT_RATE = ABANDONED_CARTS_WITH_ITEM / CARTS_WITH_ITEM,
+      NON_ABANDONED_RATE = NON_ABANDONED_CARTS_WITH_ITEM / CARTS_WITH_ITEM,
+      .groups = "drop"
+    ) |>
+    
+    # Join to materials
+    mutate(ITEM_ID = suppressWarnings(as.integer(ITEM_ID))) |>
+    inner_join(materials, by = c("ITEM_ID" = "MATERIAL_ID"))
+  
+  return(item_abandonment)
+}
+
+item_abandonment <- compute_item_abandonment(gao, materials)
+
+# display table
+item_abandonment |>
+  arrange(desc(ABANDONMENT_RATE)) |>
+  slice_head(n = 50)
+```
+
+This table shows that there are a few items with very high abandonment rates, but the overall volume per item can be very low. In order to get a better idea of which items are in a higher number of carts and may also have a higher abandonment rate, we decided to create some visuals and tables to help weigh the rate vs volume issue.
+
+#### Top Items Appearing in Abandoned Carts
+
+ Our baseline abandonment rate is approximately 15%, so we decided to take a look at the items that had an abandonment rate above that baseline.
+
+```{r}
+# filter for items with an abandonment rate above 15%
+top_n_items <- item_abandonment |>
+  filter(ABANDONMENT_RATE >= 0.15) |>
+  arrange(desc(ABANDONED_CARTS_WITH_ITEM)) |>
+  slice_head(n = 20)
+
+# max rate in this plot
+max_rate <- max(top_n_items$ABANDONMENT_RATE, na.rm = TRUE)
+
+# plot with legend title showing the max
+ggplot(top_n_items, aes(x = reorder(ITEM_ID, ABANDONED_CARTS_WITH_ITEM),
+                        y = ABANDONED_CARTS_WITH_ITEM,
+                        fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "white",
+    high = "#BB021E",
+    labels = label_percent(accuracy = 1)  
+  ) +
+  labs(
+    title = "Top 20 Items (Abandonment Rate ≥ 15%)",
+    x = "Item SKU",
+    y = "Number of Abandoned Carts",
+    fill = paste0("Abandonment Rate\n(max: ", percent(max_rate, accuracy = 0.1), ")")
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+top_n_items
+```
+
+All of these items have an abandonment rate of 15% or higher. SKU 413074, Grandma's Pantry Ginger Chai, stands out for having an abandonment rate of 21%, and it appears in approximately 78 abandoned carts. 
+
+#### Top Flavors Appearing in Abandoned Carts
+
+Next we decided to look at abandonment rates based on the different categories starting with flavor.
+
+```{r}
+# aggregate by flavor, keep only ≥15 % abandonment
+flavor_abandonment <- item_abandonment |>
+  group_by(FLAVOUR_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_FLAVOUR = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_FLAVOUR = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_FLAVOUR / TOTAL_CARTS_WITH_FLAVOUR,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_FLAVOUR))
+
+# Plot top 15 flavors
+ggplot(flavor_abandonment |> slice_head(n = 15),
+       aes(x = reorder(FLAVOUR_DESC, TOTAL_ABANDONED_CARTS_WITH_FLAVOUR),
+           y = TOTAL_ABANDONED_CARTS_WITH_FLAVOUR,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Flavors (Abandonment Rate ≥ 15%)",
+    x = "Flavour",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  # keep vertical grid lines
+    panel.grid.major.y = element_blank(),                 # remove horizontal grid lines
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+head(flavor_abandonment, 15)
+```
+
+What stands out here is that there are a few flavors, such as Vanilla Raspberry, that are present in a large number of abandoned carts and, when they are put into a cart, are abandoned at a higher rate than our baseline.
+
+#### Top Pack Sizes Appearing in Abandoned Carts
+
+```{r}
+# aggregate by pack size and filter for ≥15% abandonment
+packsize_abandonment <- item_abandonment |>
+  mutate(PACK_SIZE_DESC = ifelse(is.na(PACK_SIZE_DESC) | PACK_SIZE_DESC == "", "Unknown", PACK_SIZE_DESC)) |>
+  group_by(PACK_SIZE_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_PACKSIZE = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_PACKSIZE = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_PACKSIZE / TOTAL_CARTS_WITH_PACKSIZE,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_PACKSIZE))
+
+# Plot top 15 pack sizes
+ggplot(packsize_abandonment |> slice_head(n = 15),
+       aes(x = reorder(PACK_SIZE_DESC, TOTAL_ABANDONED_CARTS_WITH_PACKSIZE),
+           y = TOTAL_ABANDONED_CARTS_WITH_PACKSIZE,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Pack Sizes (Abandonment Rate ≥ 15%)",
+    x = "Pack Size",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  
+    panel.grid.major.y = element_blank(),                 
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white"),
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white")
+  )
+
+# display table
+head(packsize_abandonment, 15)
+```
+
+While the 20 OZ size does appear in a large number of abandoned carts, that is probably due to it being in a large proportion of all carts. 
+
+#### Top Beverage Categories Appearing in Abandoned Carts
+
+```{r}
+# summarize item-level abandonment into beverage-category level
+bevcat_abandonment <- item_abandonment |>
+  group_by(BEV_CAT_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_BEV_CAT = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_BEV_CAT = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_BEV_CAT / TOTAL_CARTS_WITH_BEV_CAT
+  ) |>
+  arrange(desc(ABANDONMENT_RATE)) |>
+  filter(ABANDONMENT_RATE >= 0.15)
+
+# plot top 15 beverage categories
+ggplot(bevcat_abandonment |> slice_head(n = 15),
+       aes(x = reorder(BEV_CAT_DESC, TOTAL_ABANDONED_CARTS_WITH_BEV_CAT),
+           y = TOTAL_ABANDONED_CARTS_WITH_BEV_CAT,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Abandoned  Beverage Categories",
+    subtitle = "Abandonment Rate ≥ 15%",
+    x = "Beverage Category",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),  
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y = element_text(
+      color = "white",
+      angle = 30,       # diagonal angle for long category names
+      hjust = 1,
+      size = 6          
+    ),
+    axis.text.x  = element_text(color = "white", size = 9),
+    axis.title   = element_text(color = "white"),
+    plot.title   = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    plot.subtitle= element_text(color = "white"),
+    legend.text  = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin  = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+ # display table
+head(bevcat_abandonment, 15)
+```
+
+Core Sparkling appears in the highest number of abandoned carts, with an abandonment rate of 15.8%. Enhance Water Beverages has an abandonment rate of 23.11% and appears in 230 abandoned carts.
+
+#### Top Brands Appearing in Abandoned Carts
+
+```{r}
+# aggregate by trade mark / brand and filter for ≥15% abandonment
+trademark_abandonment <- item_abandonment |>
+  mutate(TRADE_MARK_DESC = ifelse(is.na(TRADE_MARK_DESC) | TRADE_MARK_DESC == "", "Unknown", TRADE_MARK_DESC)) |>
+  group_by(TRADE_MARK_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_TRADEMARK = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_TRADEMARK = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_TRADEMARK / TOTAL_CARTS_WITH_TRADEMARK,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_TRADEMARK))
+
+# plot top 15 trade marks
+ggplot(trademark_abandonment |> slice_head(n = 15),
+       aes(x = reorder(TRADE_MARK_DESC, TOTAL_ABANDONED_CARTS_WITH_TRADEMARK),
+           y = TOTAL_ABANDONED_CARTS_WITH_TRADEMARK,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Trade Marks (Abandonment Rate ≥ 15%)",
+    x = "Trade Mark / Brand",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),   
+    panel.grid.major.y = element_blank(),                  
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),  
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+# display table
+head(trademark_abandonment, 15)
+```
+
+At a 16.64% abandonment rate, Fizz Factory’s abandonment rate is only slightly above our 15% baseline, but it is present in a large number of abandoned carts at 3,334.
+
+#### Top Pack Types Appearing in Abandoned Carts
+
+```{r}
+# Aggregate by pack type and filter for ≥15% abandonment
+packtype_abandonment <- item_abandonment |>
+  mutate(PACK_TYPE_DESC = ifelse(is.na(PACK_TYPE_DESC) | PACK_TYPE_DESC == "", "Unknown", PACK_TYPE_DESC)) |>
+  group_by(PACK_TYPE_DESC) |>
+  summarise(
+    TOTAL_CARTS_WITH_PACKTYPE = sum(CARTS_WITH_ITEM, na.rm = TRUE),
+    TOTAL_ABANDONED_CARTS_WITH_PACKTYPE = sum(ABANDONED_CARTS_WITH_ITEM, na.rm = TRUE),
+    ABANDONMENT_RATE = TOTAL_ABANDONED_CARTS_WITH_PACKTYPE / TOTAL_CARTS_WITH_PACKTYPE,
+    .groups = "drop"
+  ) |>
+  filter(ABANDONMENT_RATE >= 0.15) |>                     
+  arrange(desc(TOTAL_ABANDONED_CARTS_WITH_PACKTYPE))
+
+# Plot top 15 pack types
+ggplot(packtype_abandonment |> slice_head(n = 15),
+       aes(x = reorder(PACK_TYPE_DESC, TOTAL_ABANDONED_CARTS_WITH_PACKTYPE),
+           y = TOTAL_ABANDONED_CARTS_WITH_PACKTYPE,
+           fill = ABANDONMENT_RATE)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "white", high = "#BB021E") +
+  labs(
+    title = "Top Pack Types (Abandonment Rate ≥ 15%)",
+    x = "Pack Type",
+    y = "Number of Abandoned Carts",
+    fill = "Abandonment Rate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),   
+    panel.grid.major.y = element_blank(),                  
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),  
+    plot.subtitle = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+# display table
+packtype_abandonment
+```
+
+It is difficult to tell if any of the pack types are potentially contributing to cart abandonment just by looking at the numbers. Taking into account that these are beverages or beverage-related products, it would make sense that the different materials, such as plastic, glass, or aluminum, would appear in a lot of abandoned carts. More modeling would be needed to gain deeper insight.
+
+
+## Events and Abandoned Carts
+
+Another business question was, “What behavioral events or sequence of events are the strongest predictors of cart abandonment?” We thought that `EVENT_NAME` had the best potential to help us answer this question. This column captures up to 148 different events that may occur during a particular purchase window. Many of these events can occur multiple times, such as `button_click`. Others may show up rarely or not at all.
+
+The other issue we had to consider was how the behavior of a large-volume customer, such as a wholesaler or chain retailer, might overpower the behavior of a smaller-volume customer, such as a standalone small restaurant. Taking this into consideration, we decided to compute the proportion of each individual event type that occurred in each purchase window. So, if there were 10 events and 3 of them were `button_click`, then `button_click` would have a score of 0.30. If a specific type of event did not occur, then it would have a score of 0. This way, all of our observations would keep the same dimensions without blank or missing data.
+
+The end result was a single row per `CART_ID`, 50,910 total rows, our target variable `ABANDON`, and 148 columns for all of the unique event names.
+
+This table does not contain any other data, but using `CART_ID`, it could be merged back with the aggregated table containing the other data we have. 
+
+```{r}
+# define function for normalizing events by proportion
+normalize_events_by_cart <- function(gao) {
+  # 1) Exclude the target-related events
+  excluded_events <- c("add_to_cart", "update_cart", "UpdateCart_Cart_Clicked")
+  filtered_events <- gao |>
+    filter(!EVENT_NAME %in% excluded_events)
+
+  # count how many times each event occurs in a cart
+  event_counts <- filtered_events |>
+    group_by(CART_ID, EVENT_NAME) |>
+    summarise(event_count = n(), .groups = "drop")
+
+  # normalize counts to proportions within each cart
+  normalized_events <- event_counts |>
+    group_by(CART_ID) |>
+    mutate(total_events = sum(event_count),
+           prop = event_count / total_events) |>
+    ungroup()
+
+  # pivot to wide format — one column per event
+  event_wide <- normalized_events |>
+    dplyr::select(CART_ID, EVENT_NAME, prop) |>
+    pivot_wider(names_from = EVENT_NAME,
+                values_from = prop,
+                values_fill = 0)
+
+  # add target variable (ABANDONED)
+  cart_target <- gao |>
+    distinct(CART_ID, ABANDONED)
+
+  final_data <- cart_target |>
+    left_join(event_wide, by = "CART_ID") |>
+    mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+  # return final dataset
+  final_data
+}
+
+# apply to gao
+event_normalized <- normalize_events_by_cart(gao)
+
+# display table
+head(event_normalized)
+```
+
+```{r}
+# convert to long for comparison
+events_long <- event_normalized |>
+  pivot_longer(
+    cols = -c(CART_ID, ABANDONED),
+    names_to = "EVENT_NAME",
+    values_to = "prop"
+  )
+
+# mean proportion of each event by abandonment group
+event_group_means <- events_long |>
+  group_by(ABANDONED, EVENT_NAME) |>
+  summarise(
+    mean_prop = mean(prop, na.rm = TRUE),
+    carts_with_event = sum(prop > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# “Top-N” events per group by mean proportion
+topN <- 10  # adjust as needed
+top_abandoned <- event_group_means |>
+  filter(ABANDONED == 1) |>
+  arrange(desc(mean_prop)) |>
+  slice_head(n = topN)
+
+top_not_abandoned <- event_group_means |>
+  filter(ABANDONED == 0) |>
+  arrange(desc(mean_prop)) |>
+  slice_head(n = topN)
+
+# events with the biggest difference (abandoned minus not-abandoned)
+event_lift <- event_group_means |>
+  pivot_wider(names_from = ABANDONED, values_from = c(mean_prop, carts_with_event),
+              names_prefix = "abnd_") |>
+  # columns are now mean_prop_abnd_0, mean_prop_abnd_1, etc.
+  mutate(
+    diff_mean_prop = mean_prop_abnd_1 - mean_prop_abnd_0,
+    abs_diff = abs(diff_mean_prop)
+  ) |>
+  arrange(desc(abs_diff))
+
+# events with largest differences between groups (Top-N by absolute diff)
+ggplot(event_lift |> slice_max(abs_diff, n = topN),
+       aes(x = reorder(EVENT_NAME, abs_diff),
+           y = diff_mean_prop,
+           fill = diff_mean_prop > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#BB021E", "FALSE" = "white"),
+    labels = c("TRUE" = "Abandoned Carts",
+               "FALSE" = "Non-Abandoned Carts"),
+    name = NULL   
+  ) +
+  labs(
+    title = "Difference in Mean Proportion",
+    x = "Event",
+    y = "Difference in Mean Proportion (Abandoned - Not Abandoned)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "white", size = 9),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    legend.text = element_text(color = "white"),
+    plot.margin = ggplot2::margin(t = 10, r = 40, b = 10, l = 10),
+    legend.position = "bottom"
+  )
+
+top_abandoned
+top_not_abandoned
+```
+
+The two tables list the events that have the largest mean proportion of abandoned and not-abandoned carts. There is a lot of overlap in the types of behaviors that lead up to a cart being abandoned or not. The chart does seem to indicate that events such as `view_item_list` occur a larger proportion of the time in abandoned carts. Overall, these differences appear to be fairly small.
+
+## Modeling
+
+### Attempted Modeling Efforts
+**Gaussian Mixture Models (GMM)**
+
+We attempted to identify latent behavioral segments within 500 sampled carts using Gaussian Mixture Model, but results showed significant overlap among the seven inferred clusters. Our model attempted to fit a variable volume, variable shape, axis aligned structure with minimal separation between groups, indicating that behavioral variation in event proportions is largely continuous rather than multimodal. This reinforces earlier PCA and hierarchical clustering findings that MyCoke360 users do not form distinct behavioral types but instead differ by degree of engagement or interaction intensity.
+
+### Hierarchical Clustering
+
+```{r hierarchical_clustering_sample500, message=FALSE, warning=FALSE}
+# Prepare a 500-cart random sample from the normalized event data
+event_features <- event_normalized %>%
+  dplyr::select(-CART_ID, -ABANDONED)
+
+set.seed(123)
+sample_index <- sample(nrow(event_features), 500)
+event_sample <- event_features[sample_index, ]
+
+# Remove features with zero variance to ensure valid distance calculations
+event_sample <- event_sample[, sapply(event_sample, function(x) sd(x, na.rm = TRUE) != 0)]
+
+# Standardize all variables before computing distances
+event_scaled <- scale(event_sample)
+
+# Compute the distance matrix and perform hierarchical clustering
+dist_matrix <- dist(event_scaled, method = "euclidean")
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+# Evaluate the optimal number of clusters using the silhouette method
+fviz_nbclust(event_scaled, hcut, method = "silhouette") +
+  labs(title = "Optimal Number of Clusters (Sample of 500)")
+
+# Visualize the hierarchical structure as a dendrogram
+fviz_dend(
+  hc,
+  k = 4,
+  cex = 0.6,
+  color_labels_by_k = TRUE,
+  rect = TRUE,
+  main = "Hierarchical Clustering on 500-Cart Sample"
+)
+
+# Assign cluster labels to each observation
+clusters <- cutree(hc, k = 4)
+event_clusters <- event_sample %>%
+  mutate(CLUSTER = factor(clusters))
+
+# Visualize the resulting clusters in feature space
+fviz_cluster(
+  list(data = event_scaled, cluster = clusters),
+  geom = "point",
+  ellipse.type = "norm",
+  ggtheme = theme_minimal(),
+  main = "Behavioral Clusters (500-Cart Sample)"
+)
+```
+
+The hierarchical clustering analysis on a 500-cart sample revealed that MyCoke360 users exhibit subtle but distinguishable behavioral groupings rather than sharply defined segments. Four clusters emerged using Ward’s method: a dense central group representing typical, consistent user behavior; a larger, more diffuse group capturing variable browsing patterns; and two smaller, peripheral clusters likely representing edge-case behaviors such as rapid checkouts or unusually high event activity. Although some separation is visible—suggesting modest differences in how users engage with cart and product-related events—the overlap between clusters indicates that digital ordering behavior is largely continuous. These results reinforce the insight from PCA that cart activity patterns vary by degree rather than by discrete customer types, supporting the use of predictive modeling and behavioral feature analysis over hard segmentation for understanding and reducing cart abandonment.
+
+### Association Rule mining
+
+By running the same association rule mining process on non-abandoned (purchased) carts, we can distinguish common behaviors (e.g., adding to cart) from those uniquely predictive of abandonment (e.g., frequent cart updates on mobile). Rules unique to the abandoned subset indicate friction or hesitation points, while rules unique to purchased carts suggest smooth conversion paths.
+
+```{r}
+### Association Rule Mining on Abandoned Carts
+
+# Filter for abandoned carts only
+abandoned_arule <- gao |> filter(ABANDONED == 1)
+
+# Create transactions by CART_ID and event or item behavior
+transactions_arule <- abandoned_arule |>
+  group_by(CART_ID) |>
+  summarise(actions = paste(unique(EVENT_NAME), collapse = ","))
+
+# Convert to 'transactions' object
+trans_list_arule <- strsplit(transactions_arule$actions, ",")
+txn_arule <- as(trans_list_arule, "transactions")
+
+# Run Apriori algorithm
+rules_arule <- apriori(
+  txn_arule,
+  parameter = list(supp = 0.05, conf = 0.8, minlen = 2, maxlen = 4) # had to tighten parameters because moderate thresholds were producing 1.5mil rules
+)
+
+# Inspect and visualize results
+inspect(head(sort(rules_arule, by = "lift"), 10))
+
+# Web-like visualization
+plot(rules_arule, method = "graph", control = list(type = "items"))
+
+```
+
+The abandoned-cart subset initially generated over 15 million rules, indicating excessive noise and redundancy in low-support event combinations. To improve interpretability, we increased the support and confidence thresholds to retain only the most meaningful behavioral patterns (those occurring in ≥5% of transactions with ≥80% confidence).
+
+The graph above visualizes the strongest co-occurring behavioral events among abandoned carts. Red nodes indicate events with the highest lift, while node size reflects event frequency. Unsurprisingly, `UpdateCart_Cart_Clicked` and `CartPage_Displayed` appear as central, high-lift nodes, suggesting customers frequently revisit or modify their carts without completing a purchase, indicating a key friction point in the checkout process.
+
+```{r purchased arule}
+### Association Rule Mining Purchased vs. Abandoned Carts
+
+# Purchased carts subset
+purchased_arule <- gao |> filter(ABANDONED == 0)
+
+# Transactions for purchased carts
+transactions_purchased <- purchased_arule |>
+  group_by(CART_ID) |>
+  summarise(actions = paste(unique(EVENT_NAME), collapse = ","))
+
+# Convert to transactions object
+trans_list_purchased <- strsplit(transactions_purchased$actions, ",")
+txn_purchased <- as(trans_list_purchased, "transactions")
+
+# Generate rules
+rules_purchased <- apriori(
+  txn_purchased,
+  parameter = list(supp = 0.01, conf = 0.6, minlen = 2, maxlen= 4)
+)
+
+# Sort and inspect top rules
+inspect(head(sort(rules_purchased, by = "lift"), 10))
+
+# Visualize
+plot(rules_arule, method = "graph", control = list(type = "items"))
+```
+
+Association rule mining was applied to non-abandoned (purchased) carts to uncover the behavioral event patterns most strongly linked to successful checkouts. Using the Apriori algorithm with a support threshold of 1% and a confidence threshold of 60%, we identified frequent co-occurrences of user actions that lead to order completion.
+
+The above network visualization maps these behavioral rules, where node size reflects event frequency (support) and color intensity corresponds to rule strength (lift). Events such as `session_start`, `add_to_cart`, `view_cart`, and `UpdateCart_Cart_Clicked` form the central core of this network, highlighting a consistent, streamlined sequence of engagement leading to purchase.
+
+In contrast to abandoned carts, this structure shows tighter interconnections and higher-lift associations among checkout-related events, suggesting that successful purchasers follow a more linear and predictable path through the ordering funnel. These strong behavioral links indicate efficient task completion and reduced friction points during the checkout process.
+
+In comparison, the abandoned-cart network displayed a more diffuse structure, with weaker and less cohesive relationships between events. High-lift nodes such as `UpdateCart_Cart_Clicked` and `CartPage_Displayed` appeared frequently but were not strongly connected to downstream purchase actions. This pattern suggests that abandoned sessions are characterized by repetitive cart interactions and navigation loops rather than a steady progression toward checkout.
+
+By contrast, the purchased-cart rules indicate a clear and efficient behavioral flow. Users begin with product exploration events like `Categories_PLP_Retrieved` and `view_cart`, then transition smoothly through cart updates and session engagement to order completion. The stronger rule lift and tighter clustering in the purchased segment highlight reduced decision friction and fewer interruptions, suggesting that successful transactions are driven by focused, goal-directed engagement.
+
+```{r arule comparison}
+# filter for top 500 rules to shorten processing time into dfs
+rules_arule <- head(sort(rules_arule, by = "lift"), 500)
+rules_purchased <- head(sort(rules_purchased, by = "lift"), 500)
+
+# Convert to data frames
+rules_abandoned_df <- as(rules_arule, "data.frame")
+rules_purchased_df <- as(rules_purchased, "data.frame")
+
+# Identify unique or shared antecedents
+unique_to_abandoned <- anti_join(rules_abandoned_df, rules_purchased_df, by = "rules")
+unique_to_purchased <- anti_join(rules_purchased_df, rules_abandoned_df, by = "rules")
+```
+
+```{r visualize comparison}
+
+# Create a common field for grouping
+rules_abandoned_df$group <- "Abandoned"
+rules_purchased_df$group <- "Purchased"
+
+# Combine into one frame
+rules_compare_df <- bind_rows(rules_abandoned_df, rules_purchased_df)
+
+# Limit to top 10 rules
+top_rules <- rules_compare_df %>%
+  group_by(group) %>%
+  arrange(desc(lift)) %>%
+  slice_head(n = 10) %>%     # strictly 10 rules per group
+  ungroup()
+
+
+top_rules <- top_rules %>%
+  mutate(
+    rules_short = gsub("[\\{\\}]", "", rules),   # remove { and }
+    rules_short = str_trunc(rules_short, width = 45, side = "right")
+  )
+
+# Plot
+ggplot(top_rules, aes(x = lift, y = reorder(rules_short, lift), fill = group)) +
+  geom_col(alpha = 0.9, show.legend = FALSE) +
+  facet_wrap(~ group, scales = "free_y") +
+  scale_fill_manual(values = c("Abandoned" = "#BB021E", "Purchased" = "gray70")) +
+  labs(
+    title = "Top 10 Association Rules by Lift",
+    subtitle = "Comparison of behavioral patterns between Abandoned and Purchased Carts",
+    x = "Lift",
+    y = "Rule (truncated)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_line(color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.x  = element_text(color = "white", size = 9),
+    axis.text.y  = element_text(color = "white", size = 8),
+    axis.title   = element_text(color = "white"),
+    plot.title   = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    plot.subtitle= element_text(size = 11, color = "gray80", hjust = 0),
+    strip.text   = element_text(face = "bold", color = "white", size = 11),
+    legend.text  = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    legend.position = "bottom",
+    plot.margin  = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+```
+
+By applying the Apriori algorithm to both abandoned and purchased subsets, we were able to compare which event sequences appeared exclusively in abandoned carts versus those leading to successful conversions. Rules unique to abandoned carts—such as frequent cart updates and repeated cart page displays—suggest friction points or hesitation during the checkout process. In contrast, rules prevalent among purchased carts highlight smoother behavioral paths, typically involving fewer cart modifications and more direct navigation to checkout.
+
+This rule-based behavioral segmentation provided an interpretable framework to distinguish between engaged, decisive purchasers and uncertain or distracted browsers, offering actionable insights for interface design improvements, retargeting strategies, and checkout optimization.
+
+```{r}
+# Select top N rules
+top_abandoned_rules <- head(sort(rules_arule, by = "lift"), 15)
+top_purchased_rules <- head(sort(rules_purchased, by = "lift"), 15)
+
+# Combine abandoned + purchased for one unified feature set
+all_top_rules <- c(top_abandoned_rules, top_purchased_rules)
+rule_strings <- labels(lhs(all_top_rules))
+
+# Collapse all events per cart
+cart_patterns <- gao %>%
+  group_by(CART_ID) %>%
+  summarise(events = paste(unique(EVENT_NAME), collapse = ","))
+
+# Flag whether each rule's antecedent appears in a cart
+for (i in seq_along(rule_strings)) {
+  terms <- str_remove_all(rule_strings[i], "[\\{\\}]") %>% str_split(",") %>% unlist()
+  cart_patterns[[paste0("rule_", i)]] <-
+    map_lgl(cart_patterns$events, ~ all(terms %in% str_split(.x, ",")[[1]]))
+}
+
+# create single behavioral intensity variable
+rule_weights <- quality(all_top_rules)$lift
+cart_patterns$RULE_SCORE <- rowSums(cart_patterns[, paste0("rule_", 1:length(all_top_rules))] * rule_weights)
+
+# merge rule features to dataset
+gao <- gao |>
+  mutate(
+    CART_ID = paste(CUSTOMER_ID, CUTOFF_TIMESTAMP, sep = "_")
+  )
+
+arule_model_df <- left_join(gao, cart_patterns[, c("CART_ID", "RULE_SCORE")], by = "CART_ID") %>%
+  mutate(RULE_SCORE = replace_na(RULE_SCORE, 0))
+```
+
+Next, we wanted to see if segmenting the data by business type changed any associative rules. The data was aggregated by `COLD_DRINK_CHANNEL` then mined again.
+
+```{r}
+### Association Rule Mining by Cold Drink Channel
+
+# Choose a channel subset (e.g., Restaurant, Workplace, etc.) 
+channels <- unique(gao$COLD_DRINK_CHANNEL_DESCRIPTION)
+print(channels)
+
+# Function to safely run Apriori per channel
+run_arules_by_channel <- function(df, channel, supp = 0.03, conf = 0.7, minlen = 2, maxlen = 4) {
+  message(sprintf("\n🧃 Running Apriori for channel: %s", channel))
+  
+  # Filter abandoned carts for that channel
+  sub_df <- df %>%
+    filter(ABANDONED == 1,
+           COLD_DRINK_CHANNEL_DESCRIPTION == channel) %>%
+    group_by(CART_ID) %>%
+    summarise(actions = paste(unique(EVENT_NAME), collapse = ",")) %>%
+    ungroup()
+  
+  # Skip if too few carts
+  if (nrow(sub_df) < 50) {
+    warning(paste("Skipped channel", channel, "— too few transactions"))
+    return(NULL)
+  }
+  
+  # Convert to transactions
+  txn_list <- strsplit(sub_df$actions, ",")
+  txn <- as(txn_list, "transactions")
+  
+  # Run Apriori
+  rules <- apriori(
+    txn,
+    parameter = list(supp = supp, conf = conf, minlen = minlen, maxlen = maxlen)
+  )
+  
+  # Return top 15 by lift
+  head(sort(rules, by = "lift"), 15)
+}
+
+# --- 2. Run for each channel and store results ---
+channel_rules <- lapply(channels, function(ch) run_arules_by_channel(gao, ch))
+names(channel_rules) <- channels
+
+# --- 3. Inspect one example (e.g., "Restaurant") ---
+inspect(channel_rules[["Restaurant"]])
+
+# --- 4. Optional: visualize rules for each segment ---
+plot(channel_rules[["Restaurant"]], method = "graph",
+     main = "Restaurant Channel – Abandoned Cart Rules")
+
+plot(channel_rules[["Workplace"]], method = "grouped",
+     main = "Workplace Channel – Rule Clusters")
+```
+
+```{r}
+# Rank segments by number of abandoned carts
+abandon_counts <- gao %>%
+  filter(ABANDONED == 1) %>%
+  dplyr::count(COLD_DRINK_CHANNEL_DESCRIPTION, sort = TRUE)
+
+top2 <- head(abandon_counts$COLD_DRINK_CHANNEL_DESCRIPTION, 2)
+bottom2 <- tail(abandon_counts$COLD_DRINK_CHANNEL_DESCRIPTION, 2)
+
+selected_channels <- c(top2, bottom2)
+print(abandon_counts)
+cat("\nSelected channels (top 2 + bottom 2 by abandoned carts):\n")
+print(selected_channels)
+
+# Define a function to run Apriori analysis for one channel
+run_arules_by_channel <- function(df, channel,
+                                  supp = 0.03, conf = 0.7,
+                                  minlen = 2, maxlen = 4) {
+  message(sprintf("\nRunning Apriori for channel: %s", channel))
+  
+  sub_df <- df %>%
+    filter(ABANDONED == 1,
+           COLD_DRINK_CHANNEL_DESCRIPTION == channel) %>%
+    group_by(CART_ID) %>%
+    summarise(actions = paste(unique(EVENT_NAME), collapse = ","), .groups = "drop")
+  
+  # Skip channel if there are too few carts or no valid events
+  if (nrow(sub_df) < 50) {
+    message(sprintf("Skipped %s — only %d carts", channel, nrow(sub_df)))
+    return(NULL)
+  }
+  if (all(is.na(sub_df$actions)) || all(sub_df$actions == "")) {
+    message(sprintf("Skipped %s — no valid events", channel))
+    return(NULL)
+  }
+  
+  # Clean and validate the transaction list
+  txn_list <- strsplit(sub_df$actions, ",")
+  txn_list <- txn_list[lengths(txn_list) > 0 & !sapply(txn_list, function(x) all(is.na(x) | x == ""))]
+  txn_list <- lapply(txn_list, function(x) as.character(na.omit(trimws(x))))
+  txn_list <- txn_list[sapply(txn_list, function(x) length(x) > 0)]
+  
+  # Check that the transaction list is valid before coercion
+  if (length(txn_list) == 0 || any(!sapply(txn_list, is.character))) {
+    message(sprintf("Skipped %s — invalid transaction list structure", channel))
+    return(NULL)
+  }
+  
+  # Convert the list to a transactions object
+  txn <- tryCatch({
+    as(txn_list, "transactions")
+  }, error = function(e) {
+    message(sprintf("Conversion failed for %s: %s", channel, e$message))
+    return(NULL)
+  })
+  
+  if (is.null(txn)) {
+    message(sprintf("No valid transactions for %s", channel))
+    return(NULL)
+  }
+  
+  # Run Apriori algorithm on the transaction set
+  rules <- tryCatch({
+    apriori(txn, parameter = list(supp = supp, conf = conf,
+                                  minlen = minlen, maxlen = maxlen))
+  }, error = function(e) {
+    message(sprintf("Apriori failed for %s: %s", channel, e$message))
+    return(NULL)
+  })
+  
+  if (is.null(rules) || length(rules) == 0) {
+    message(sprintf("No rules generated for %s", channel))
+    return(NULL)
+  }
+  
+  # Return the top 15 rules by lift
+  head(sort(rules, by = "lift"), 15)
+}
+
+# Run Apriori for each selected channel (top 2 and bottom 2 segments)
+channel_rules <- list()
+
+for (ch in selected_channels) {
+  cat("\nRunning Apriori for:", ch, "\n")
+  res <- tryCatch(
+    run_arules_by_channel(gao, ch, minlen = 1),
+    error = function(e) {
+      cat("Error in", ch, ":", e$message, "\n")
+      NULL
+    }
+  )
+  channel_rules[[ch]] <- res
+}
+
+names(channel_rules) <- selected_channels
+
+# Remove NULL results before combining data
+channel_rules <- channel_rules[!sapply(channel_rules, is.null)]
+selected_channels <- names(channel_rules)
+
+# Combine results from all channels into a single data frame
+rules_df <- map_dfr(selected_channels, function(ch) {
+  rset <- channel_rules[[ch]] 
+  as(rset, "data.frame") %>%
+    mutate(COLD_DRINK_CHANNEL_DESCRIPTION = ch)
+})
+
+# Extract antecedent and consequent from rule strings
+rules_df <- rules_df %>%
+  mutate(
+    antecedent = gsub("\\{(.*)\\}.*", "\\1", rules),
+    consequent = gsub(".*\\{(.*)\\}", "\\1", rules)
+  )
+
+# Compare lift variation across segments for the same rule
+lift_diff <- rules_df %>%
+  group_by(antecedent, consequent) %>%
+  summarise(
+    lift_range = max(lift, na.rm = TRUE) - min(lift, na.rm = TRUE),
+    top_channel = COLD_DRINK_CHANNEL_DESCRIPTION[which.max(lift)],
+    bottom_channel = COLD_DRINK_CHANNEL_DESCRIPTION[which.min(lift)],
+    .groups = "drop"
+  ) %>%
+  arrange(desc(lift_range)) %>%
+  slice_head(n = 10)
+
+print(lift_diff)
+```
+
+```{r}
+rules_df$COLD_DRINK_CHANNEL_DESCRIPTION <- factor(
+  rules_df$COLD_DRINK_CHANNEL_DESCRIPTION,
+  levels = c("Restaurant", "Distributor", "Hot Beverage", "Clinic")
+)
+
+# Visualize rule lift by segment
+# Filter for top 2 segments
+rules_top2 <- rules_df %>%
+  filter(COLD_DRINK_CHANNEL_DESCRIPTION %in% c("Restaurant", "Distributor"))
+ rules_top2
+ggplot(rules_top2,
+       aes(x = COLD_DRINK_CHANNEL_DESCRIPTION,
+           y = lift,
+           color = COLD_DRINK_CHANNEL_DESCRIPTION)) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  facet_wrap(~ consequent, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c(
+    "Restaurant"  = "#BB021E",   # Swire red
+    "Distributor" = "gray70"
+  )) +
+  labs(
+    title = "Association Rule Lift – Top 2 Segments (Restaurant & Distributor)",
+    subtitle = "Higher lift indicates stronger, recurring behavioral patterns in high-volume channels",
+    x = "Cold Drink Channel Segment",
+    y = "Lift"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray30"),
+    panel.grid.minor   = element_blank(),
+    axis.text.x  = element_text(color = "white", size = 9, angle = 25, hjust = 1),
+    axis.text.y  = element_text(color = "white", size = 9),
+    axis.title   = element_text(color = "white"),
+    plot.title   = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    plot.subtitle= element_text(size = 11, color = "gray80", hjust = 0),
+    strip.text   = element_text(face = "bold", color = "white", size = 11),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text  = element_text(color = "white"),
+    plot.margin  = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+
+# Filter for bottom 2 segments
+rules_bottom2 <- rules_df %>%
+  filter(COLD_DRINK_CHANNEL_DESCRIPTION %in% c("Hot Beverage", "Clinic"))
+
+rules_bottom2
+
+ggplot(rules_bottom2,
+       aes(x = COLD_DRINK_CHANNEL_DESCRIPTION,
+           y = lift,
+           color = COLD_DRINK_CHANNEL_DESCRIPTION)) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  facet_wrap(~ consequent, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = c(
+    "Hot Beverage" = "gray70",
+    "Clinic"       = "white"
+  )) +
+  labs(
+    title = "Association Rule Lift – Bottom 2 Segments (Hot Beverage & Clinic)",
+    subtitle = "Lower lift values indicate weaker or less consistent behavioral co-occurrence patterns",
+    x = "Cold Drink Channel Segment",
+    y = "Lift"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background  = element_rect(fill = "#1C1C1C", color = NA),
+    panel.background = element_rect(fill = "#1C1C1C", color = NA),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray30"),
+    panel.grid.minor   = element_blank(),
+    axis.text.x  = element_text(color = "white", size = 9, angle = 25, hjust = 1),
+    axis.text.y  = element_text(color = "white", size = 9),
+    axis.title   = element_text(color = "white"),
+    plot.title   = element_text(size = 14, face = "bold", color = "white", hjust = 0),
+    plot.subtitle= element_text(size = 11, color = "gray80", hjust = 0),
+    strip.text   = element_text(face = "bold", color = "white", size = 11),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text  = element_text(color = "white"),
+    plot.margin  = ggplot2::margin(t = 10, r = 40, b = 10, l = 10)
+  )
+```
+
+Large commercial accounts (particularly Restaurants and Distributors) show the strongest and most repetitive behavioral patterns in the MyCoke360 platform, yet also face the highest cart abandonment rates. Their patterns indicate it is likely structural and process-related friction rather than lack of intent. These users often know what they want to buy but are slowed down by workflow complexity and digital interface limitations.
+
+In contrast, the Hot Beverage and Clinic segments exhibit weaker and more diffuse association rule lift patterns, reflecting less structured and less frequent digital ordering behavior. These smaller customers are not disengaged, but their interactions on the MyCoke360 platform are sporadic, simple, and low-repetition, suggesting occasional rather than habitual use. Their behavioral data points to transactional simplicity rather than workflow friction. 
+
+Together, these visualizations highlight that abandonment risk and behavioral predictability are both driven by customer scale and interaction complexity: large accounts behave consistently but face friction points that drive abandonment, while smaller accounts act more sporadically but with lower overall risk.
+
+### Logistic Regression Model
+
+Originally, our baseline model achieved an AUC of approximately 0.85, meaning it correctly distinguished between abandoned and completed carts about 85% of the time. This seemed high for a basic model, since we have an 85/15 split on the majority/minority class, it was predicting the majority class the entire time.
+
+Moving forward, we pared down the analysis variables and fixed the data leakage that we saw in the first model. This approach allows us to move beyond simple one-to-one relationships and identify combinations of behaviors that meaningfully change the odds of abandonment.
+
+```{r}
+# Check for numeric variables in current dataset
+gao |>
+  glimpse()
+
+# New model dataframe
+lr <- gao |>
+  filter(!EVENT_NAME %in% c('add_to_cart', 'update_cart', 'UpdateCart_Cart_Clicked')) |>
+  dplyr::select(-c(WINDOW_ID, ITEMS, ANCHOR_DATE, SALES_OFFICE_DESC, DISTRIBUTION_MODE_DESC, CUTOFF_TIMESTAMP, CUSTOMER_ID, CART_ID, EVENT_PAGE_NAME, EVENT_PAGE_TITLE, CREATED_DATE_ADJUSTED_MATCH, EVENT_TIMESTAMP_ADJ, CUSTOMER_SUB_TRADE_CHANNEL_DESCRIPTION, TOTAL_ITEMS, PURCHASE_EVENT, DAYS_SINCE_LAST_PURCHASE, EVENT_NAME)) |>
+  mutate(
+    # convert all character columns to factors
+    across(where(is.character), as.factor)
+  )
+
+# Check that mutation and variable removal worked
+lr |>
+  glimpse()
+
+lr |>
+  str()
+```
+
+```{r}
+set.seed(673)
+idx <- createDataPartition(lr$ABANDONED, p = 0.7, list = FALSE)
+train <- lr[idx, ]
+test  <- lr[-idx, ]
+
+# Fit logistic regression
+lr_fit <- speedglm(ABANDONED ~ ., data = train, family = binomial())
+summary(lr_fit)
+
+# Evaluate on holdout
+test$pred_prob <- predict(lr_fit, newdata = test, type = "response")
+roc_obj <- roc(response = test$ABANDONED, predictor = test$pred_prob)
+auc_val <- auc(roc_obj)
+
+test$pred_class <- ifelse(test$pred_prob >= 0.5, 1, 0)
+
+cat("AUC:", round(auc_val, 3), "\n")
+caret::confusionMatrix(
+factor(test$pred_class, levels = c(0,1)),
+factor(test$ABANDONED, levels = c(0,1)),
+positive = "1"
+)
+```
+
+This logistic regression indicates that there is a statistically significant positive relationship between use of mobile device (as opposed to a tablet) and cart abandonment. Additionally, using a ChromeOS increases likelihood of abandonment while using an iOS or Linux OS decreases likelihood of abandonment. The frequency was also statistically significant. While a frequency of every 3 weeks had a positive relationship with abandonment, a frequency of every week or every 4 weeks was associated with lower abandonment. Certain anchor days of the week also had differing relationships with cart abandonment. Tuesday was most correlated with abandonment with Monday, Wednesday, and Thursday following behind. Interestingly, Sunday's correlation was negative and Saturday's was not statistically significant. Certain sales offices also had positive or negative correlations with cart abandonment. The highest correlations were with offices G151 and G152 located in Scottsbluff, NE and Cheyenne, WY respectively. Finally, the BK/OF/SL (bulk distribution, ofs, sideload) combination of distribution modes had the highest statistically significant positive correlation with cart abandonment. Most cutoff times had a negative correlation with cart abandonment. The cutoff times with the strongest negative correlation (>2) were 10am and 2:30pm. The type of customer (`COLD_DRINK_CHANNEL_DESCRIPTION`) of 'Hot Beverage' was highly negatively correlated with cart abandonment. Finally, the `ITEM_BIN` and `DEVICE_MOBILE_BRAND_NAME` variables had mixed results - mostly not statistically significant. These results provide valuable insights into cart abandonment that can be further explored.
+
+#### Device and OS
+
+```{r}
+# Plot abandonment rate by device
+lr1 <- gao |>
+  group_by(DEVICE_CATEGORY) |>
+  summarise(
+    abandonment_rate = mean(ABANDONED, na.rm = TRUE),
+    n = n()
+  ) |>
+  ggplot(aes(x = DEVICE_CATEGORY, y = abandonment_rate, fill = DEVICE_CATEGORY == 'mobile')) +
+  geom_col(alpha = 0.8) +  # Swire Coca-Cola red
+  scale_fill_manual(values = c("TRUE" = "#BB021E", "FALSE" = "gray70")) +
+  labs(
+    title = "Abandonment Rate by Device",
+    x = "Device Type",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5),
+    plot.title = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "none"
+  )
+
+# Extract logistic regression coefficients
+coef_df <- data.frame(
+  term = names(coef(lr_fit)),
+  estimate = coef(lr_fit)
+) |>
+  filter(grepl("DEVICE_OPERATING_SYSTEM", term)) |>
+  mutate(
+    OS = gsub("DEVICE_OPERATING_SYSTEM", "", term)   # clean term name
+  ) |>
+  filter(!OS %in% c("Macintosh", "Windows")) |>      # remove unwanted OS
+  mutate(
+    color = case_when(
+      OS == "Chrome OS" ~ "#BB021E",                 # red
+      OS %in% c("iOS", "Linux") ~ "black",
+      TRUE ~ "gray70"
+    )
+  )
+
+# Plot
+lr2 <- ggplot(coef_df, aes(x = reorder(OS, estimate), y = estimate, fill = color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Effect of OS on Abandonment",
+    x = "Operating System",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5),
+    plot.title = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    legend.position = "none"
+  )
+
+lr1 | lr2
+```
+
+The plot on the left combined with the logistic regression clearly shows that mobile devices have a statistically significant higher level of cart abandonment. This may be because of difficulty placing orders on a smaller mobile screen or may be due to issues with the mobile application. It may be possible to decrease cart abandonment by encouraging or incentivising customers to use tablets or desktop application.
+
+The plot on the right shows the statistically significant OS effects from the logistic regression. It is clear that Linux and iOS have a negative correlation with cart abandonment while Chrome OS has a positive correlation. It would be difficult to control customer OS but this gives us valuable information that could be used to target customers using a Chrome OS to help decrease their abandonment rates. 
+
+#### Order Frequency and Anchor Day of Week
+
+```{r}
+# Extract coefficients from your logistic regression model
+freq_coef_df <- data.frame(
+  term = names(coef(lr_fit)),
+  estimate = coef(lr_fit)
+) |>
+  # Keep only frequency terms
+  filter(grepl("FREQUENCY_FINAL", term)) |>
+  mutate(
+    # Clean term names
+    frequency = gsub("FREQUENCY_FINAL", "", term),
+    # Assign colors
+    fill_color = case_when(
+      frequency == "Every 3 Weeks" ~ "#BB021E",          # red
+      frequency %in% c("Every Week", "Every 4 Weeks") ~ "black",
+      TRUE ~ "gray70"
+    )
+  )
+
+# Plot coefficients
+lr3 <- ggplot(freq_coef_df, aes(x = reorder(frequency, estimate), y = estimate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Effect of Frequency on Cart Abandonment",
+    x = "Frequency",
+    y = "Logistic Regression Coefficient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Plot ANCHOR_DAY_OF_WEEK
+important_days <- c("Tuesday", "Monday", "Wednesday", "Thursday")
+
+day_levels <- c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+
+lr4 <- gao |>
+  group_by(ANCHOR_DAY_OF_WEEK) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  mutate(
+    # Order days correctly
+    ANCHOR_DAY_OF_WEEK = factor(ANCHOR_DAY_OF_WEEK, levels = day_levels),
+    # Highlight important days
+    fill_color = ifelse(ANCHOR_DAY_OF_WEEK %in% important_days, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = ANCHOR_DAY_OF_WEEK, y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Anchor Day",
+    x = "Day of Week",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+lr3 | lr4
+```
+
+These plots clearly show that ordering every week or every 4 weeks is associated with less cart abandonment while ordering every 3 weeks is correlated with more cart abandonment. Additionally, the anchor weekdays Monday - Thursday have the highest abandonment rates. This helps use understand who Swire should target with their interventions to reduce cart abandonment. 
+
+#### Sales Office and Distribution Mode
+
+```{r}
+# Sales office plot
+important_offices <- c("G151", "G152")
+
+sales_office_plot <- gao |>
+  group_by(SALES_OFFICE) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  ungroup() |>
+  slice_max(abandonment_rate, n = 10) |>   # keep top 10
+  mutate(
+    fill_color = ifelse(SALES_OFFICE %in% important_offices, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = reorder(SALES_OFFICE, abandonment_rate), y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Sales Office",
+    subtitle = "Top 10",
+    x = "Sales Office",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Distribution mode plot
+important_distribution <- "BK; OF; SL"
+
+distribution_plot <- gao |>
+  group_by(DISTRIBUTION_MODE) |>
+  summarise(abandonment_rate = mean(ABANDONED, na.rm = TRUE)) |>
+  ungroup() |>
+  slice_max(abandonment_rate, n = 10) |>   # keep top 10
+  mutate(
+    fill_color = ifelse(DISTRIBUTION_MODE == important_distribution, "#BB021E", "gray70")
+  ) |>
+  ggplot(aes(x = reorder(DISTRIBUTION_MODE, abandonment_rate), y = abandonment_rate, fill = fill_color)) +
+  geom_col() +
+  scale_fill_identity() +
+  labs(
+    title = "Abandonment by Distribution Mode",
+    subtitle = "Top 10",
+    x = "Distribution Mode",
+    y = "Abandonment Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(color = "#BB021E", hjust = 0),
+    legend.position = "none"
+  )
+
+# Facet wrap plots
+sales_office_plot | distribution_plot
+```
+
+These two plots show the top 10 sales offices and distribution modes by abandonment rate with high statistically significant correlation with abandonment highlighted in red. Offices G151 and G152 located in Scottsbluff, NE and Cheyenne, WY respectively had a high correlation with cart abandonment when running the logistic model. As such, it may be that businesses ordering from Cheyenne and Scottsbluff are more likely to abandon their carts because of the rural nature of the distributor offices. There may be issues especially with the Cheyenne location that cause customers to abandon their carts. This should be further studied to understand what the issue could be. Also, it seems that the combination of bulk distribution, ofs, and sideload lead to increased abandonment. This could be because of the variety of ways in which the goods are delivered. This might complicate the ordering process which leads to increased cart abandonment. Further industry knowledge is necessary to definitively understand the significance of these factors in cart abandonment. 
+
+## Summary of Findings
+
+### Prevention of Target Variable Leakage
+
+In our original modeling efforts, we realized that the `EVENT_NAME` variable we used to create the target variable was resulting in target leakage into our models. This was evident because the `EVENT_NAME` variable was by far the highest feature importance in our Random Forest model. Additionally, when analyzing cart abandonment rates by `EVENT_NAME`, we found that the `EVENT_NAME` values that were used to create the target abandonment variable were the only ones with an abandonment rate > 1. As a result, in our final models, we not only removed the target but also filtered to exclude the event names that we used to build our cart abandonment variable. This ensured that there was no target variable leakage. One limitation of our efforts is that because we removed rows from our data to prevent target variable leakage, we may not be capturing the full behavioral panel that leads to cart abandonment. However, we are confident that our analysis captures the most significant behaviors leading to cart abandonment.
+
+### Acknowledgement of Limitations
+
+During our analysis, we encountered several limitations that constrained our modeling and interpretability:
+
+ - **Lack of control data:** No pre-treatment window to analyze whether the platform changes casued an effect in cart abandonment.
+ - **Missing data:** `google_analytics` doesn't capture all events - it appears that some were deleted or not logged properly.
+ - **Outliers:** Known outliers in the data that skewed results.
+ - **Highly correlated features:** Many features exhibited multicollinearity, complicating coefficient interpretation in regression models. It also caused increased difficulty in separating observations for clustering.
+
+### Conclusion of Findings
+
+Our final modeling efforts identified clear behavioral and contextual patterns influencing digital cart abandonment on the MyCoke360 platform. Unfortunately, during compilation we suffered some data leaking in our logistic regression models that we haven't quite rooted out yet. However, after addressing early leakage issues, our logistic regression models could be capable of providing interpretable, credible insights into how user interactions relate to purchase completion. We will continue to address leakage issues this week.
+
+Key findings include:
+
+ - **Device category played a significant role:** mobile users showed a higher probability of abandonment compared to desktop users, consistent with potential usability friction on smaller screens.
+
+ - **Cart size and item volume were strong predictors:** very small and very large carts were more likely to be abandoned, suggesting both low-intent “browsers” and overwhelmed bulk purchasers may disengage before checkout.
+
+ - **Days since last purchase negatively correlated with abandonment:** customers who purchased more recently were less likely to abandon their carts, indicating that engagement and familiarity reduce drop-off risk.
+
+ - **Event-level analysis:** revealed that repetitive behaviors such as `UpdateCart_Cart_Clicked` and frequent page revisits are associated with hesitation and increased abandonment odds.
+
+After preventing target leakage and ensuring cart-level independence between training and testing data, the final logistic regression achieved a realistic AUC between 0.70–0.75, indicating moderate predictive ability while maintaining interpretability.
+
+These results reinforce the importance of interface simplification, proactive cart reminders, and behavioral segmentation as potential interventions. While the limited time window of available data constrained causal inference and time-series modeling, this framework provides a validated foundation for expanding predictive monitoring and designing future experiments that can directly quantify improvements in conversion and digital engagement.
+
+### Future Continuation 
+
+While our models successfully described behaviors associated with cart abandonment, there are several opportunities available for further examination and refinement. 
+
+Future  continuation upon this modeling could include:
+
+ - Causal Inference: Expanding dataset to include pre-treatment data. Introduce experimental designs to estimate possible causal impact of the new platform. 
+ 
+ - Deployment and monitoring: Package the final model into a production-ready dashboard or API, enabling continuous monitoring of predicted abandonment risk and real-time alerts for high-risk carts.
+ 
+ - Temporal and sequence modeling: Also requiring an expanded dataset that includes pre-treatment data, we could implement time-aware models to capture event-level sequences and transitions that precede abandonment, allowing us to better understand behavioral activity through the ordering funnel.
